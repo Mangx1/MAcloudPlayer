@@ -792,4 +792,7 @@
         <item quantity="other">%d downloads queued</item>
     </plurals>
     <string name="player_is_live">Live</string>
+    <string name="title_local_video">Video Lokal</string>
+    <string name="local_video_empty">Tidak ada video di folder Download</string>
+    <string name="local_video_permission_required">Izinkan akses video untuk menampilkan video dari folder Download</string>
 </resources>

@@ -6,7 +6,9 @@ import android.content.Context
 import android.content.DialogInterface
 import android.content.Intent
 import android.os.Bundle
+import android.view.Gravity
 import android.view.LayoutInflater
+import android.widget.FrameLayout
 import android.view.View
 import android.view.ViewGroup
 import android.widget.AbsListView
@@ -15,6 +17,7 @@ import android.widget.ImageView
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.navigation.fragment.findNavController
 import androidx.activity.ComponentActivity
 import androidx.appcompat.app.AlertDialog
 import androidx.core.net.toUri
@@ -35,6 +38,7 @@ import com.lagradost.cloudstream3.AllLanguagesName
 import com.lagradost.cloudstream3.CommonActivity.showToast
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.R
+import com.google.android.material.button.MaterialButton
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.databinding.FragmentHomeBinding
@@ -667,6 +671,17 @@ class HomeFragment : BaseFragment<FragmentHomeBinding>(
         binding.apply {
             //homeChangeApiLoading.setOnClickListener(apiChangeClickListener)
             //homeChangeApiLoading.setOnClickListener(apiChangeClickListener)
+            homeIptvFab.setOnClickListener {
+                findNavController().navigate(R.id.navigation_iptv)
+            }
+
+            homeLocalVideoFab.setOnClickListener {
+                findNavController().navigate(R.id.navigation_local_video)
+            }
+
+            homeIptvFab.isVisible = isLayout(PHONE)
+            homeLocalVideoFab.isVisible = isLayout(PHONE)
+
             homeApiFab.setOnClickListener(apiChangeClickListener)
             homeApiFab.setOnLongClickListener {
                 if (currentApiName == noneApi.name) return@setOnLongClickListener false
