@@ -110,6 +110,7 @@ import com.lagradost.cloudstream3.utils.DataStoreHelper
 import com.lagradost.cloudstream3.utils.DataStoreHelper.getViewPos
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.MAcloudMetadata
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.SingleSelectionHelper.showDialog
 import com.lagradost.cloudstream3.utils.SubtitleHelper.fromTagToEnglishLanguageName
@@ -187,6 +188,18 @@ class GeneratorPlayer : FullScreenPlayer() {
     private var isNextEpisode: Boolean = false // this is used to reset the watch time
 
     private var preferredAutoSelectSubtitles: String? = null // null means do nothing, "" means none
+    private var mediaStateKey: String? = null
+    private var restoringMediaState = false
+    private var persistedSubtitle: MediaStateRepository.StoredSubtitle? = null
+
+    // State yang ditemukan sebelum player dimuat.
+    // Dipakai setelah Media3 benar-benar siap supaya subtitle delay
+    // tidak ditimpa oleh proses loadPlayer().
+    private var pendingRestoredMediaState: MediaStateRepository.MediaState? = null
+    private var pendingRestoredSubtitle: SubtitleData? = null
+
+    private var lastMediaStateSaveAt = 0L
+    private val mediaStateSaveThrottleMs = 3000L
     private val allMeta: List<ResultEpisode>?
         get() = viewModel.state.generatorState?.allMeta?.filterIsInstance<ResultEpisode>()
             ?.map { episode ->
@@ -213,12 +226,21 @@ class GeneratorPlayer : FullScreenPlayer() {
         }
 
         currentSelectedSubtitles = subtitle
+        if (userInitiated) persistSelectedSubtitle(subtitle)
         //Log.i(TAG, "setSubtitles = $subtitle")
         return player.setPreferredSubtitles(subtitle)
     }
 
     override fun embeddedSubtitlesFetched(subtitles: List<SubtitleData>) {
         viewModel.addSubtitles(subtitles.toSet())
+    }
+
+    override fun onSubtitleDelayChanged(value: Long) {
+        if (restoringMediaState) return
+
+        // Jangan tunggu playerPositionChanged().
+        // Delay harus langsung tersimpan ketika user menekan Terapkan.
+        saveMediaState(force = true)
     }
 
     override fun onTracksInfoChanged() {
@@ -231,6 +253,35 @@ class GeneratorPlayer : FullScreenPlayer() {
             player.setPreferredAudioTrack(preferredAudioTrackLanguage)
         }
         updatePlayerInfo()
+
+        // Media3 bisa mengembalikan subtitle offset ke 0 ketika
+        // loadPlayer/reloadPlayer selesai. Karena itu metadata
+        // diterapkan setelah duration/track player sudah tersedia.
+        if (
+            !restoringMediaState &&
+            pendingRestoredMediaState != null &&
+            (player.getDuration() ?: 0L) > 0L
+        ) {
+            applyPendingMediaState()
+        }
+    }
+
+    private fun applyPendingMediaState() {
+        val saved = pendingRestoredMediaState ?: return
+
+        restoringMediaState = true
+
+        try {
+            pendingRestoredSubtitle?.let {
+                setSubtitles(it, false)
+            }
+
+            subtitleDelay = saved.subtitleDelayMs
+        } finally {
+            restoringMediaState = false
+            pendingRestoredMediaState = null
+            pendingRestoredSubtitle = null
+        }
     }
 
     override fun playerStatusChanged() {
@@ -251,6 +302,222 @@ class GeneratorPlayer : FullScreenPlayer() {
             return 0L
         }
         return durPos.position
+    }
+
+    private fun metadataVideoKey(): String? =
+        viewModel.state.generatorState?.id?.let {
+            "video:$it"
+        }
+
+    private fun metadataVideoTitle(): String {
+        return getPlayerVideoTitle().ifBlank {
+            (currentMeta as? ExtractorUri)?.name
+                ?: getMetaData().name
+                ?: "Video"
+        }
+    }
+
+
+    private fun getMediaStateKey(): String? {
+        val state = viewModel.state.generatorState ?: return null
+        val metadata = getMetaData()
+
+        val title = when (val meta = state.meta) {
+            is ResultEpisode -> meta.headerName
+            is ExtractorUri -> meta.headerName ?: meta.name
+            else -> state.response?.name
+        }
+
+        return MediaStateRepository.buildKey(
+            stateId = state.id,
+            title = title ?: state.response?.name,
+            year = state.response?.year,
+            imdbId = state.response?.getImdbId(),
+            tmdbId = state.response?.getTMDbId()?.toString(),
+            malId = state.response?.getMalId()?.toString(),
+            aniListId = state.response?.getAniListId()?.toString(),
+            season = metadata.season,
+            episode = metadata.episode,
+        )
+    }
+
+    private fun getMediaStateTitle(): String? {
+        val state = viewModel.state.generatorState ?: return null
+
+        return when (val meta = state.meta) {
+            is ResultEpisode -> meta.headerName
+            is ExtractorUri -> meta.headerName ?: meta.name
+            else -> state.response?.name
+        }
+    }
+
+    private fun saveMediaState(
+        stored: MediaStateRepository.StoredSubtitle? = null,
+        force: Boolean = false
+    ) {
+        val ctx = context ?: return
+        val key = mediaStateKey ?: getMediaStateKey() ?: return
+
+        if (!force) {
+            val now = System.currentTimeMillis()
+            if (now - lastMediaStateSaveAt < mediaStateSaveThrottleMs) {
+                return
+            }
+            lastMediaStateSaveAt = now
+        } else {
+            lastMediaStateSaveAt = System.currentTimeMillis()
+        }
+
+        mediaStateKey = key
+
+        val selected = currentSelectedSubtitles
+        val effectiveStored = stored ?: persistedSubtitle
+
+        val subtitleType = when {
+            selected == null -> "none"
+            selected.origin == SubtitleOrigin.EMBEDDED_IN_VIDEO -> "embedded"
+            else -> "external"
+        }
+
+        val state = MediaStateRepository.MediaState(
+            key = key,
+            title = getMediaStateTitle(),
+            positionMs = player.getPosition() ?: 0L,
+            durationMs = player.getDuration() ?: 0L,
+            subtitleType = subtitleType,
+            subtitleFileUri = effectiveStored?.uri,
+            subtitleLanguage =
+                effectiveStored?.language
+                    ?: selected?.languageCode
+                    ?: selected?.getIETF_tag(),
+            subtitleName = effectiveStored?.name ?: selected?.originalName,
+            subtitleMimeType = effectiveStored?.mimeType ?: selected?.mimeType,
+            subtitleSource =
+                if (effectiveStored == null) selected?.url else null,
+            subtitleDelayMs = subtitleDelay,
+        )
+
+        ioSafe {
+            MediaStateRepository.save(ctx, state)
+        }
+    }
+
+    private fun persistSelectedSubtitle(
+        subtitle: SubtitleData?
+    ) {
+        if (restoringMediaState) return
+
+        val ctx = context ?: return
+        val key = mediaStateKey ?: getMediaStateKey() ?: return
+
+        mediaStateKey = key
+
+        if (
+            subtitle == null ||
+            subtitle.origin == SubtitleOrigin.EMBEDDED_IN_VIDEO
+        ) {
+            persistedSubtitle = null
+            saveMediaState()
+            return
+        }
+
+        persistedSubtitle = null
+
+        ioSafe {
+            val stored =
+                MediaStateRepository.storeSubtitle(
+                    ctx,
+                    subtitle,
+                    key
+                )
+
+            runOnMainThread {
+                if (stored != null) persistedSubtitle = stored
+                saveMediaState(stored)
+            }
+        }
+    }
+
+    private fun restoreMediaState() {
+        val ctx = context ?: return
+        val key = getMediaStateKey() ?: return
+
+        mediaStateKey = key
+
+        ioSafe {
+            val saved =
+                MediaStateRepository.load(ctx, key)
+                    ?: return@ioSafe
+
+            runOnMainThread {
+                if (!isAdded) return@runOnMainThread
+
+                restoringMediaState = true
+
+                try {
+                    when (saved.subtitleType) {
+                        "none" -> {
+                            persistedSubtitle = null
+                            setSubtitles(null, false)
+                        }
+
+                        "external" -> {
+                            val restored =
+                                MediaStateRepository.restoreExternalSubtitle(
+                                    ctx,
+                                    saved
+                                )
+
+                            if (restored != null) {
+                                persistedSubtitle =
+                                    MediaStateRepository.StoredSubtitle(
+                                        uri = restored.url,
+                                        mimeType = restored.mimeType,
+                                        name = restored.originalName,
+                                        language = restored.languageCode
+                                    )
+                                viewModel.addSubtitles(setOf(restored))
+                                player.setActiveSubtitles(
+                                    viewModel.state.subtitles
+                                )
+                                player.saveData()
+                                player.reloadPlayer(ctx)
+                                setSubtitles(restored, false)
+                            }
+                        }
+
+                        "embedded" -> {
+                            persistedSubtitle = null
+                            val match =
+                                viewModel.state.subtitles.firstOrNull { sub ->
+                                    sub.origin ==
+                                        SubtitleOrigin.EMBEDDED_IN_VIDEO &&
+                                        (
+                                            saved.subtitleLanguage
+                                                .isNullOrBlank() ||
+                                            sub.languageCode.equals(
+                                                saved.subtitleLanguage,
+                                                true
+                                            ) ||
+                                            sub.originalName.equals(
+                                                saved.subtitleName,
+                                                true
+                                            )
+                                        )
+                                }
+
+                            if (match != null) {
+                                setSubtitles(match, false)
+                            }
+                        }
+                    }
+
+                    subtitleDelay = saved.subtitleDelayMs
+                } finally {
+                    restoringMediaState = false
+                }
+            }
+        }
     }
 
     private var currentVerifyLink: Job? = null
@@ -525,27 +792,115 @@ class GeneratorPlayer : FullScreenPlayer() {
         // load player
         context?.let { ctx ->
             val (url, uri) = link
-            val subtitles = viewModel.state.subtitles
+
+            // ====================================================
+            // MAcloud persistent media state
+            // ====================================================
+            //
+            // PENTING:
+            // Jangan menggunakan URL streaming sebagai identitas.
+            // URL mirror/source bisa berubah setiap kali video dibuka.
+            //
+            // MediaStateRepository menggunakan TMDB/IMDb/MAL/AniList
+            // + season/episode, sehingga mirror berbeda tetap memakai
+            // metadata yang sama.
+            val mediaKey = getMediaStateKey()
+
+            mediaStateKey = mediaKey
+
+            val savedMediaState =
+                if (!sameEpisode && !isNextEpisode && mediaKey != null) {
+                    MediaStateRepository.load(ctx, mediaKey)
+                } else {
+                    null
+                }
+
+            pendingRestoredMediaState = savedMediaState
+
+            val restoredSubtitle =
+                savedMediaState?.let {
+                    MediaStateRepository.restoreExternalSubtitle(ctx, it)
+                }
+
+            pendingRestoredSubtitle = restoredSubtitle
+
+            restoredSubtitle?.let { savedSubtitle ->
+                if (
+                    viewModel.state.subtitles.none {
+                        it.url == savedSubtitle.url
+                    }
+                ) {
+                    viewModel.addSubtitles(
+                        setOf(savedSubtitle)
+                    )
+                }
+
+                player.setActiveSubtitles(
+                    viewModel.state.subtitles
+                )
+
+                currentSelectedSubtitles = savedSubtitle
+
+                persistedSubtitle =
+                    MediaStateRepository.StoredSubtitle(
+                        uri = savedSubtitle.url,
+                        mimeType = savedSubtitle.mimeType,
+                        name = savedSubtitle.originalName,
+                        language = savedSubtitle.languageCode
+                    )
+            }
+
+            val subtitles =
+                viewModel.state.subtitles
+
+            val preferredSubtitle =
+                if (sameEpisode) {
+                    currentSelectedSubtitles
+                } else {
+                    pendingRestoredSubtitle
+                        ?: getAutoSelectSubtitle(
+                            subtitles,
+                            settings = true,
+                            downloads = true
+                        )
+                }
+
             player.loadPlayer(
                 ctx,
                 sameEpisode,
                 url,
                 uri,
-                startPosition = if (sameEpisode) null else {
-                    if (isNextEpisode) 0L else getPos()
-                },
+                startPosition =
+                    if (sameEpisode) {
+                        null
+                    } else {
+                        if (isNextEpisode) {
+                            0L
+                        } else {
+                            pendingRestoredMediaState
+                                ?.takeIf {
+                                    it.positionMs > 0L &&
+                                        it.durationMs > 0L &&
+                                        it.positionMs < (it.durationMs * 95L / 100L)
+                                }
+                                ?.positionMs
+                                ?: getPos()
+                        }
+                    },
                 subtitles,
-                (if (sameEpisode) currentSelectedSubtitles else null) ?: getAutoSelectSubtitle(
-                    subtitles, settings = true, downloads = true
-                ),
+                preferredSubtitle,
                 preview = true
             )
+
         }
 
         if (!sameEpisode) {
             player.addTimeStamps(emptyList()) // clear stamps
-            // Resets subtitle delay, as we watch some other content
-            player.setSubtitleOffset(0)
+
+            // Keep the subtitle delay restored from MAcloud metadata.
+            pendingRestoredMediaState?.let { restoredState ->
+                player.setSubtitleOffset(restoredState.subtitleDelayMs)
+            }
         }
     }
 
@@ -896,7 +1251,14 @@ class GeneratorPlayer : FullScreenPlayer() {
         player.saveData()
         player.reloadPlayer(ctx)
 
-        setSubtitles(selectedSubtitle, false)
+        // Ini adalah subtitle yang dipilih user.
+        // setSubtitles(..., true) akan menyalinnya ke:
+        //
+        // Download/MAcloudPlayer/subtitles/
+        //
+        // sehingga URI Download asli tidak diperlukan lagi saat
+        // video dibuka di kemudian hari.
+        setSubtitles(selectedSubtitle, true)
 
         selectSourceDialog?.dismissSafe()
         selectSourceDialog = null
@@ -1714,6 +2076,27 @@ class GeneratorPlayer : FullScreenPlayer() {
     }
 
     override fun onDestroy() {
+        val metadataKey =
+            metadataVideoKey()
+
+        val metadataContext =
+            context
+
+        if (
+            metadataKey != null &&
+            metadataContext != null
+        ) {
+            MAcloudMetadata.savePlaybackNow(
+                metadataContext,
+                metadataKey,
+                metadataVideoTitle(),
+                player.getPosition() ?: 0L,
+                player.getDuration() ?: 0L,
+                currentSelectedSubtitles,
+                player.getSubtitleOffset()
+            )
+        }
+
         ResultFragment.updateUI()
         currentVerifyLink?.cancel()
         super.onDestroy()
@@ -1751,6 +2134,11 @@ class GeneratorPlayer : FullScreenPlayer() {
             currentMeta,
             nextMeta
         )
+
+        // Simpan posisi ke metadata MAcloud.
+        // MediaStateRepository melakukan throttle agar tidak menulis
+        // file JSON pada setiap frame/player callback.
+        saveMediaState()
 
         var isOpVisible = false
         when (val meta = currentMeta) {

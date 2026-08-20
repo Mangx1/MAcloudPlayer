@@ -100,11 +100,16 @@ open class FullScreenPlayer : AbstractPlayerFragment<FragmentPlayerBinding>(
     protected var playerRotateEnabled = false
     protected var rotatedManually = false
     private var hideControlsNames = false
+    protected open fun onSubtitleDelayChanged(value: Long) = Unit
+
     protected var subtitleDelay
-        set(value) = try {
-            player.setSubtitleOffset(-value)
-        } catch (e: Exception) {
-            logError(e)
+        set(value) {
+            try {
+                player.setSubtitleOffset(-value)
+            } catch (e: Exception) {
+                logError(e)
+            }
+            onSubtitleDelayChanged(value)
         }
         get() = try {
             -player.getSubtitleOffset()

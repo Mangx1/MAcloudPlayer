@@ -84,7 +84,7 @@ object OfflinePlaybackHelper {
                             name = name ?: getString(activity, R.string.downloaded_file),
                             // well not the same as a normal id, but we take it as users may want to
                             // play downloaded files and save the location
-                            id = uri.lastPathSegment?.toLongOrNull()?.hashCode() ?: uri.lastPathSegment?.hashCode()
+                            id = uri.toString().hashCode()
                         )
                     )
                 ), 0
